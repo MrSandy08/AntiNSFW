@@ -1,0 +1,4 @@
+nudenet
+Pillow
+torch
+transformers
