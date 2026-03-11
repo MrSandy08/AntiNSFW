@@ -127,4 +127,4 @@ class Handler(BaseHTTPRequestHandler):
 
 PORT = int(os.environ.get('NUDENET_PORT', 5000))
 print(f'· Servidor escuchando en puerto {PORT}')
-HTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
+HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
