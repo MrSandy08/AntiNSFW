@@ -1,14 +1,11 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import tempfile
-import os
-import io
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import json, tempfile, os, io
 from nudenet import NudeDetector
 from PIL import Image
 import torch
 from transformers import CLIPProcessor, CLIPModel
 
-# ── NudeNet (NSFW/desnudez) ──────────────────────────────────────────────────
+# ── NudeNet ──────────────────────────────────────────────────────────────────
 detector = NudeDetector()
 print("· NudeNet cargado OK")
 
@@ -18,72 +15,76 @@ NSFW_LABELS = {
     'FEMALE_BREAST_EXPOSED',
     'ANUS_EXPOSED',
     'BUTTOCKS_EXPOSED',
-    'FEMALE_GENITALIA_COVERED',
-    'MALE_GENITALIA_COVERED',
 }
 NSFW_THRESHOLD = 0.55
 
-# ── CLIP (gore / violencia) ───────────────────────────────────────────────────
-print("· Cargando CLIP para detección de gore...")
+# ── CLIP (gore) ───────────────────────────────────────────────────────────────
+print("· Cargando CLIP...")
 clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model.eval()
 print("· CLIP cargado OK")
 
-# Candidatos: cuanto mayor sea la probabilidad de los labels gore, se bloquea
-GORE_LABELS  = [
+GORE_LABELS = [
     "gore, blood and guts, extreme violence",
     "graphic injury, mutilation, dead body",
     "animal cruelty, torture",
 ]
-SAFE_LABELS  = [
+SAFE_LABELS = [
     "a normal everyday photo",
     "food, landscape, people talking",
 ]
-ALL_LABELS   = GORE_LABELS + SAFE_LABELS
-GORE_THRESHOLD = 0.50   # probabilidad mínima de cualquier etiqueta gore para bloquear
+ALL_LABELS     = GORE_LABELS + SAFE_LABELS
+GORE_THRESHOLD = 0.50
 
 def check_gore(image_bytes: bytes) -> tuple[bool, float, str]:
-    """Retorna (es_gore, score_max, label_ganadora)"""
     try:
         image  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         inputs = clip_processor(text=ALL_LABELS, images=image, return_tensors="pt", padding=True)
         with torch.no_grad():
-            logits = clip_model(**inputs).logits_per_image   # shape [1, n_labels]
-        probs  = logits.softmax(dim=-1)[0].tolist()
-
-        # Solo miramos las probs de los labels gore
+            logits = clip_model(**inputs).logits_per_image
+        probs      = logits.softmax(dim=-1)[0].tolist()
         gore_probs = probs[:len(GORE_LABELS)]
         max_score  = max(gore_probs)
         max_label  = GORE_LABELS[gore_probs.index(max_score)]
-        is_gore    = max_score >= GORE_THRESHOLD
-        return is_gore, round(max_score, 3), max_label
+        return max_score >= GORE_THRESHOLD, round(max_score, 3), max_label
     except Exception as e:
-        print(f"· CLIP gore error: {e}")
+        print(f"· CLIP error: {e}")
         return False, 0.0, ""
 
-
-# ── Handler HTTP ──────────────────────────────────────────────────────────────
+# ── Handler ───────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
+    def log_message(self, format, *args): pass  # silenciar logs de cada request
 
     def do_POST(self):
         try:
             length = int(self.headers.get('Content-Length', 0))
             data   = self.rfile.read(length)
+            if not data:
+                self._json(400, {'error': 'empty body'})
+                return
 
-            # ── 1. NudeNet ──
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-            tmp.write(data)
-            tmp.close()
+            # Intentar abrir como imagen antes de pasarla a NudeNet
             try:
+                Image.open(io.BytesIO(data)).verify()
+            except Exception:
+                self._json(400, {'error': 'invalid image'})
+                return
+
+            # ── NudeNet ──
+            detections = []
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+            try:
+                # Guardar como JPEG normalizado (evita errores con WebP/PNG raros)
+                img = Image.open(io.BytesIO(data)).convert('RGB')
+                img.save(tmp.name, 'JPEG', quality=90)
+                tmp.close()
                 detections = detector.detect(tmp.name)
             except Exception as e:
-                detections = []
                 print(f'· NudeNet detect error: {e}')
             finally:
-                os.unlink(tmp.name)
+                try: os.unlink(tmp.name)
+                except: pass
 
             nsfw_hits = [
                 d for d in detections
@@ -91,40 +92,41 @@ class Handler(BaseHTTPRequestHandler):
             ]
             nsfw_flag = len(nsfw_hits) > 0
 
-            # ── 2. CLIP gore (solo si NudeNet no encontró nada, para ahorrar tiempo) ──
+            # ── CLIP gore (solo si NudeNet no encontró nudidad) ──
             gore_flag, gore_score, gore_label = False, 0.0, ""
             if not nsfw_flag:
                 gore_flag, gore_score, gore_label = check_gore(data)
 
             result = {
-                'nsfw':       nsfw_flag or gore_flag,
+                'nsfw':        nsfw_flag or gore_flag,
                 'nsfw_nudity': nsfw_flag,
                 'nsfw_gore':   gore_flag,
                 'hits': [{'label': d['class'], 'score': round(d['score'], 3)} for d in nsfw_hits],
                 'gore_hit': {'label': gore_label, 'score': gore_score} if gore_flag else None,
-                'all':  [{'label': d['class'], 'score': round(d['score'], 3)} for d in detections]
+                'all':  [{'label': d['class'], 'score': round(d['score'], 3)} for d in detections],
             }
-
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json(200, result)
 
         except Exception as e:
-            print(f'· server error: {e}')
-            self.send_response(500)
-            self.end_headers()
+            print(f'· handler error: {e}')
+            self._json(500, {'error': str(e)})
 
     def do_GET(self):
-        body = b'nudenet+gore ok'
+        # Health check — Railway espera 200 aquí
+        body = b'nudenet+clip ok'
         self.send_response(200)
         self.send_header('Content-Length', len(body))
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.end_headers()
+        self.wfile.write(body)
 
-PORT = int(os.environ.get('NUDENET_PORT', 5000))
-print(f'· Servidor escuchando en puerto {PORT}')
-HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+PORT = int(os.environ.get('PORT', os.environ.get('NUDENET_PORT', 5000)))
+print(f'· Servidor escuchando en :{PORT}')
+ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
